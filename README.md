@@ -236,12 +236,12 @@ systemctl --user status bot-noticias.service
 journalctl --user -u bot-noticias.service -n 30 --no-pager
 ```
 
-**Nota:** el desarrollo de esta etapa se hace en una rama aparte; no actualices `main` ni reinicies el servicio hasta aprobar la integración.
+**Estado:** las preferencias de audio avanzadas ya están integradas en `main`. Actualiza Fedora con respaldo y pruebas antes de reiniciar el servicio.
 
 
 ## NewsBot v2 — resúmenes, alertas, semanal y diagnóstico
 
-> Esta sección documenta la rama de desarrollo `feature/newsbot-v2-inteligencia-alertas`. **No despliegues la rama en Fedora antes de pasar las pruebas y revisar la integración.**
+> **Estado:** estas funciones están integradas en `main` y han pasado las pruebas automatizadas. Haz un respaldo de SQLite y verifica el funcionamiento en Fedora antes de activar alertas o envíos semanales.
 
 ### Resúmenes trazables
 
@@ -293,7 +293,7 @@ print("Backup SQLite:", dst)
 PY
 ```
 
-Luego de integrar la rama a `main` y confirmar el resultado del CI:
+Después de confirmar que la versión de `main` pasó las pruebas automatizadas:
 
 ```bash
 git switch main
