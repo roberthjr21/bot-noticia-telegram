@@ -1,0 +1,44 @@
+# No subir tokens ni secretos
+.env
+.env.*
+!.env.example
+
+# Entornos y cachés
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# SQLite privado
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Variables privadas
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Bases de datos
+*.db
+*.sqlite
+*.sqlite3
+
+# Registros
+*.log
