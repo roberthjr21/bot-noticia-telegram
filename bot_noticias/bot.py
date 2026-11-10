@@ -11,6 +11,7 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
+from .audio_settings import AUDIO_MODES, AUDIO_RATES, AUDIO_VOICES, audio_keyboard, audio_text, resolve_voice
 from .config import Config, validate_time
 from .database import Database
 from .news import TOPICS, NewsItem, get_news
@@ -53,7 +54,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗞 Ver noticias ahora", callback_data="news:all")],
         [InlineKeyboardButton("🎯 Mis temas", callback_data="menu:topics"),
          InlineKeyboardButton("⏰ Hora del resumen", callback_data="menu:time")],
-        [InlineKeyboardButton("🔊 Activar / desactivar voz", callback_data="menu:voice"),
+        [InlineKeyboardButton("🎙 Audio y voces", callback_data="menu:audio"),
          InlineKeyboardButton("🎧 Escuchar noticias", callback_data="news:listen")],
         [InlineKeyboardButton("📋 Mi configuración", callback_data="menu:status"),
          InlineKeyboardButton("⏯ Pausar / activar", callback_data="menu:toggle")],
@@ -95,10 +96,14 @@ def status_text(db: Database, config: Config, chat_id: int) -> str:
     if not subscriber:
         return "Primero envía /start para configurar tu resumen."
     status = "🟢 Activado" if subscriber["enabled"] else "⏸ Pausado"
+    audio = db.audio_settings(chat_id)
     return (
         "<b>⚙️ Tu configuración</b>\n\n"
         f"Estado: {status}\n"
         f"Lectura en voz alta: {'🔊 Activada' if subscriber.get('voice_enabled') else '🔇 Desactivada'}\n"
+        f"Modo de audio: {escape(AUDIO_MODES[audio['audio_mode']][0])}\n"
+        f"Voz: {escape(AUDIO_VOICES[audio['voice_key']][0])}\n"
+        f"Velocidad: {escape(AUDIO_RATES[audio['rate_key']][0])}\n"
         f"Envío diario: <b>{subscriber['daily_time']}</b>\n"
         f"Zona horaria: <b>{escape(config.timezone_name)}</b>\n"
         f"Temas: {escape(format_topics(db.topics(chat_id)))}\n\n"
@@ -188,8 +193,12 @@ async def send_digest(
     subscriber = db.get(chat_id)
     if force_audio or (subscriber and subscriber.get("voice_enabled")):
         try:
+            audio = db.audio_settings(chat_id)
             await send_spoken_news(
-                context, chat_id, items, scheduled=scheduled, voice_name=config.tts_voice
+                context, chat_id, items, scheduled=scheduled,
+                voice_name=resolve_voice(audio["voice_key"], config.tts_voice),
+                mode=audio["audio_mode"],
+                rate=AUDIO_RATES[audio["rate_key"]][1],
             )
         except Exception:
             logger.exception("No se pudo generar o enviar el audio para %s", chat_id)
@@ -248,6 +257,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start — comenzar y mostrar botones\n"
         "/noticias — noticias recientes de tus temas\n"
         "/voz — activar o desactivar audios automáticos\n"
+        "/audio — elegir modo, voz y velocidad\n"
         "/escuchar — recibir noticias en audio ahora\n"
         "/categoria ia — consultar una categoría\n"
         "/temas — activar o desactivar categorías\n"
@@ -291,6 +301,22 @@ async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "🔊 Lectura en voz alta activada. Tus noticias llegarán en texto y audio."
         if enabled else "🔇 Lectura en voz alta desactivada. Seguirás recibiendo noticias en texto.",
         reply_markup=main_keyboard(),
+    )
+
+
+async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
+    db = get_db(context)
+    chat_id = update.effective_chat.id
+    subscriber = db.get(chat_id)
+    if not subscriber:
+        await update.message.reply_text("Primero envía /start para configurar el bot.")
+        return
+    await update.message.reply_text(
+        audio_text(db.audio_settings(chat_id), bool(subscriber["voice_enabled"]), get_config(context).tts_voice),
+        parse_mode=ParseMode.HTML,
+        reply_markup=audio_keyboard(db.audio_settings(chat_id), bool(subscriber["voice_enabled"])),
     )
 
 
@@ -468,12 +494,35 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=times_keyboard(current),
         )
     elif data == "menu:voice":
+        # Compatibilidad con botones de mensajes anteriores.
         enabled = not bool(db.get(chat_id).get("voice_enabled"))
         db.set_voice_enabled(chat_id, enabled)
         await callback.edit_message_text(
-            "🔊 Lectura en voz alta activada: recibirás noticias en texto y audio."
-            if enabled else "🔇 Lectura en voz alta desactivada: solo recibirás texto.",
-            reply_markup=main_keyboard(),
+            audio_text(db.audio_settings(chat_id), enabled, config.tts_voice),
+            parse_mode=ParseMode.HTML,
+            reply_markup=audio_keyboard(db.audio_settings(chat_id), enabled),
+        )
+    elif data == "menu:audio" or data.startswith("audio:"):
+        if data == "audio:toggle":
+            db.set_voice_enabled(chat_id, not bool(db.get(chat_id)["voice_enabled"]))
+        elif data.startswith("audio:"):
+            parts = data.split(":")
+            columns = {"mode": ("audio_mode", AUDIO_MODES),
+                       "voice": ("voice_key", AUDIO_VOICES),
+                       "rate": ("rate_key", AUDIO_RATES)}
+            if len(parts) != 3 or parts[1] not in columns or parts[2] not in columns[parts[1]][1]:
+                await callback.message.reply_text("⚠️ Opción de audio no válida.")
+                return
+            field = columns[parts[1]][0]
+            if db.audio_settings(chat_id)[field] == parts[2]:
+                return  # Evita el error Telegram 'Message is not modified'.
+            db.set_audio_setting(chat_id, field, parts[2])
+        enabled = bool(db.get(chat_id)["voice_enabled"])
+        settings = db.audio_settings(chat_id)
+        await callback.edit_message_text(
+            audio_text(settings, enabled, config.tts_voice),
+            parse_mode=ParseMode.HTML,
+            reply_markup=audio_keyboard(settings, enabled),
         )
     elif data == "menu:status":
         await callback.edit_message_text(
@@ -503,6 +552,7 @@ async def post_init(application: Application) -> None:
         BotCommand("start", "Iniciar y abrir el menú"),
         BotCommand("noticias", "Leer noticias recientes"),
         BotCommand("voz", "Activar o desactivar narración"),
+        BotCommand("audio", "Configurar voz, modo y velocidad"),
         BotCommand("escuchar", "Escuchar noticias en audio"),
         BotCommand("temas", "Elegir temas"),
         BotCommand("hora", "Cambiar la hora diaria"),
@@ -536,6 +586,7 @@ def create_application(config: Config, database: Database) -> Application:
     app.add_handler(CommandHandler(["ayuda", "help"], help_command))
     app.add_handler(CommandHandler(["noticias", "ahora"], news_command))
     app.add_handler(CommandHandler("voz", voice_command))
+    app.add_handler(CommandHandler("audio", audio_command))
     app.add_handler(CommandHandler("escuchar", listen_command))
     app.add_handler(CommandHandler("categoria", category_command))
     app.add_handler(CommandHandler("temas", topics_command))
@@ -545,6 +596,6 @@ def create_application(config: Config, database: Database) -> Application:
     app.add_handler(CommandHandler("reanudar", resume_command))
     app.add_handler(CommandHandler("fuentes", sources_command))
     app.add_handler(CommandHandler("miid", id_command))
-    app.add_handler(CallbackQueryHandler(callbacks, pattern=r"^(?:menu:|topic:|time:|news:).+"))
+    app.add_handler(CallbackQueryHandler(callbacks, pattern=r"^(?:menu:|topic:|time:|news:|audio:).+"))
     app.add_error_handler(error_handler)
     return app

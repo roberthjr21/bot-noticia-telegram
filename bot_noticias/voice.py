@@ -1,7 +1,6 @@
-"""Lectura opcional de noticias en español mediante síntesis de voz en línea.
+"""Narración opcional en español con modos, velocidad y voz por usuario.
 
-Si ffmpeg está instalado, Telegram recibe una nota de voz OGG/Opus.
-Sin ffmpeg, recibe un archivo MP3 reproducible. Nunca guarda audios permanentemente.
+La voz se sintetiza en línea mediante edge-tts. Los audios son temporales.
 """
 
 from __future__ import annotations
@@ -11,30 +10,46 @@ import logging
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
 
-from telegram.ext import ContextTypes
-
+from .audio_settings import AUDIO_MODES, AUDIO_RATES
 from .news import NewsItem, TOPICS, clean_text
+
+if TYPE_CHECKING:
+    from telegram.ext import ContextTypes
 
 log = logging.getLogger(__name__)
 
 
-def speech_text(items: list[NewsItem], *, scheduled: bool = False) -> str:
-    """Crea un guion breve; no lee URLs ni texto HTML del RSS."""
+def speech_text(items: list[NewsItem], *, scheduled: bool = False, mode: str = "normal") -> str:
+    """Construye guion a partir de titulares y RSS; no inventa detalles ni lee URLs."""
+    if mode not in AUDIO_MODES:
+        raise ValueError("Modo de audio desconocido")
     opening = (
         "Buenos días. Aquí tienes tu resumen diario de noticias."
         if scheduled else "Estas son las noticias más recientes para ti."
     )
     lines = [opening]
-    for index, item in enumerate(items[:5], 1):
+    selected = items[:3] if mode == "rapido" else items[:5]
+    for index, item in enumerate(selected, 1):
         label = TOPICS.get(item.topic, ("", "Actualidad", ""))[1]
         title = clean_text(item.title, 240)
-        description = clean_text(item.description, 180)
+        description = clean_text(item.description, 300 if mode == "detallado" else 180)
         lines.append(f"Noticia {index}. {label}. {title}.")
-        if description and description.lower() not in title.lower():
+        if mode == "detallado":
+            source = clean_text(item.source, 70)
+            if source:
+                lines.append(f"Medio: {source}.")
+            if item.published:
+                lines.append(f"Fecha de publicación: {item.published:%d/%m/%Y}.")
+        if mode != "rapido" and description and description.lower() not in title.lower():
             lines.append(description + ".")
     lines.append("Puedes abrir los enlaces del mensaje para conocer todos los detalles.")
-    return " ".join(lines)[:3500]
+    max_chars = {"rapido": 700, "normal": 1900, "detallado": 3500}[mode]
+    script = " ".join(lines)
+    if len(script) > max_chars:
+        script = script[:max_chars].rsplit(" ", 1)[0].rstrip(" ,.;:") + "."
+    return script
 
 
 async def send_spoken_news(
@@ -44,14 +59,20 @@ async def send_spoken_news(
     *,
     scheduled: bool,
     voice_name: str,
+    mode: str = "normal",
+    rate: str = "+0%",
 ) -> None:
-    """Genera y envía el audio; falla sin interrumpir la entrega del texto."""
-    import edge_tts  # Import diferido para facilitar las pruebas sin internet.
+    """Genera y envía audio; los fallos se manejan en el llamador."""
+    if rate not in {value[1] for value in AUDIO_RATES.values()}:
+        raise ValueError("Velocidad de audio desconocida")
+    import edge_tts  # Import diferido; las pruebas no requieren internet.
 
-    script = speech_text(items, scheduled=scheduled)
+    script = speech_text(items, scheduled=scheduled, mode=mode)
     with TemporaryDirectory(prefix="newsbot_audio_") as temp:
         mp3 = Path(temp) / "noticias.mp3"
-        await asyncio.wait_for(edge_tts.Communicate(script, voice=voice_name).save(str(mp3)), timeout=100)
+        await asyncio.wait_for(
+            edge_tts.Communicate(script, voice=voice_name, rate=rate).save(str(mp3)), timeout=100
+        )
         if not mp3.exists() or mp3.stat().st_size == 0:
             raise RuntimeError("El servicio de voz no produjo un audio válido")
 
