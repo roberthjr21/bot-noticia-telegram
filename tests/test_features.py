@@ -135,14 +135,26 @@ class SummariesTests(unittest.TestCase):
         content = format_news_message([n], "America/Bogota", scheduled=True)
         self.assertIn("Prueba &amp; novedades", content)
         self.assertNotIn("<b>Prueba</b>", content)
-        self.assertIn("Qué se sabe", content)
-        self.assertIn("fragmentos RSS", content)
+        self.assertIn("Fragmento de la fuente", content)
+        self.assertIn("Google News RSS", content)
         self.assertIn("https://example.com/noticia", content)
 
-    def test_missing_excerpt_is_explicit(self):
+    def test_missing_excerpt_omits_repeated_placeholder(self):
         n = item()
         no_excerpt = NewsItem(n.topic, n.title, n.url, n.source, n.published, "", n.fingerprint)
-        self.assertIn("no incluye más detalles", article_summary(no_excerpt))
+        self.assertEqual(article_summary(no_excerpt), "")
+        message = format_news_message([no_excerpt], "America/Bogota")
+        self.assertNotIn("El RSS no incluye más detalles", message)
+        self.assertIn("Leer la fuente", message)
+
+    def test_related_headlines_labeled(self):
+        n = item()
+        with_related = NewsItem(n.topic, n.title, n.url, n.source, n.published, "", n.fingerprint,
+                                ("Otra noticia relacionada", "Otro titular sobre el tema"))
+        message = format_news_message([with_related], "America/Bogota")
+        self.assertIn("Otros titulares relacionados en RSS", message)
+        self.assertIn("Otra noticia relacionada", message)
+        self.assertNotIn("Qué se sabe", message)
 
     def test_weekly_balances_categories(self):
         rows = [

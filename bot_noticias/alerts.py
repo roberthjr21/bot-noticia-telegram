@@ -54,11 +54,20 @@ def choose_alert(items: list[NewsItem], topics: list[str], excluded: set[str], n
 def alert_message(item: NewsItem) -> str:
     from html import escape
     from .summaries import article_summary
+    excerpt = article_summary(item)
+    if excerpt:
+        detail = f"📝 Fragmento de la fuente: {escape(excerpt)}\n"
+    elif item.related_headlines:
+        detail = "🗞 Otros titulares en RSS: " + "; ".join(
+            escape(headline) for headline in item.related_headlines
+        ) + "\n"
+    else:
+        detail = ""
     return (
         "🔔 <b>Novedad destacada</b>\n\n"
         f"<b>{escape(item.title)}</b>\n"
         f"Medio: {escape(item.source)}\n"
-        f"📝 {escape(article_summary(item))}\n"
+        f"{detail}"
         f'<a href="{escape(item.url, quote=True)}">🔗 Leer la noticia</a>\n\n'
         "<i>Selección automática por palabras clave. No es una alerta de emergencia ni "
         "una confirmación independiente del contenido.</i>"
