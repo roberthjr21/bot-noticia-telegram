@@ -133,7 +133,8 @@ class SummariesTests(unittest.TestCase):
     def test_html_escaping_and_rss_disclaimer(self):
         n = item(title="<b>Prueba</b> & novedades")
         content = format_news_message([n], "America/Bogota", scheduled=True)
-        self.assertIn("&lt;b&gt;Prueba&lt;/b&gt;", content)
+        self.assertIn("Prueba &amp; novedades", content)
+        self.assertNotIn("<b>Prueba</b>", content)
         self.assertIn("Qué se sabe", content)
         self.assertIn("fragmentos RSS", content)
         self.assertIn("https://example.com/noticia", content)

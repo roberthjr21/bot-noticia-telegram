@@ -176,7 +176,9 @@ def schedule_user(app: Application, chat_id: int) -> None:
     weekly_name = f"weekly:{chat_id}"
     for job in queue.get_jobs_by_name(weekly_name):
         job.schedule_removal()
-    if subscriber and subscriber["enabled"]:
+    if subscriber and subscriber["enabled"] and (
+        not config.allowed_user_ids or subscriber["user_id"] in config.allowed_user_ids
+    ):
         hour, minute = map(int, subscriber["daily_time"].split(":"))
         queue.run_daily(
             send_daily_job,
@@ -319,6 +321,8 @@ async def send_weekly_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     features = db.features(chat_id)
     if not subscriber or not subscriber["enabled"] or not features["weekly_enabled"]:
         return
+    if config.allowed_user_ids and subscriber["user_id"] not in config.allowed_user_ids:
+        return
     local_now = datetime.now(config.timezone)
     # Clave de la semana que termina este domingo.
     key = f"{local_now.isocalendar().year}-W{local_now.isocalendar().week:02d}"
@@ -368,6 +372,7 @@ async def send_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     subscribers = [
         sub for sub in db.subscribers()
         if sub["enabled"] and db.features(sub["chat_id"])["alerts_enabled"]
+        and (not config.allowed_user_ids or sub["user_id"] in config.allowed_user_ids)
     ]
     if not subscribers:
         return

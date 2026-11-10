@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from html import escape
 
 from .news import NewsItem, TOPICS, clean_text
@@ -18,9 +19,10 @@ def article_summary(item: NewsItem) -> str:
 
 
 def format_news_message(items: list[NewsItem], timezone_name: str, *, scheduled: bool = False) -> str:
-    date_label = datetime.now().strftime("%d/%m/%Y")
+    date_label = datetime.now(ZoneInfo(timezone_name)).strftime("%d/%m/%Y")
     heading = "☀️ <b>Tu resumen diario</b>" if scheduled else "🗞 <b>Noticias para ti</b>"
-    lines = [f"{heading} · {date_label}", f"<i>{len(items)} noticias · Zona: {escape(timezone_name)}</i>"]
+    count_label = "noticia" if len(items) == 1 else "noticias"
+    lines = [f"{heading} · {date_label}", f"<i>{len(items)} {count_label} · Zona: {escape(timezone_name)}</i>"]
     for i, item in enumerate(items, 1):
         emoji, category, _ = TOPICS[item.topic]
         lines.append(f"\n<b>{i}. {escape(clean_text(item.title, 240))}</b>")
