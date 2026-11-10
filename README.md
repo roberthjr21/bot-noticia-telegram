@@ -206,3 +206,34 @@ bot-noticia-telegram/
 - No ejecutar dos copias del mismo bot con el mismo token por *long polling*, porque pueden competir por las actualizaciones.
 
 Licencia de ejemplo: MIT (ver `LICENSE`).
+
+
+## 🎧 NewsBot v2 — etapa 2: modos de audio y voces
+
+Esta actualización añade preferencias de narración **por chat**, sin perder la hora, los temas ni el estado de voz que ya estaban guardados en SQLite.
+
+1. Envía `/audio` o pulsa **🎙 Audio y voces** en el menú principal.
+2. Selecciona un modo: **⚡ Rápido** (hasta ~1 minuto; hasta 3 titulares), **🎙 Normal** (hasta ~3 minutos; hasta 5 titulares y fragmentos) o **📖 Detallado** (hasta ~5 minutos; incluye medio y fecha cuando están disponibles).
+3. Selecciona la voz: **Predeterminada** (respeta `TTS_VOICE` del `.env`), **Salomé** (`es-CO-SalomeNeural`) o **Gonzalo** (`es-CO-GonzaloNeural`).
+4. Selecciona velocidad **Lenta** (-15 %), **Normal** o **Rápida** (+15 %).
+5. Pulsa **🎧 Probar narración** o envía `/escuchar`.
+
+La duración es un **máximo aproximado**, no una duración garantizada: el bot no inventa contenido ni rellena audios cuando el RSS tiene poca información. Los modos detallados tampoco leen el artículo completo. La narración usa el servicio en línea de Microsoft mediante `edge-tts`.
+
+La preferencia `/voz` sigue controlando si el resumen diario incluye audio. El nuevo menú permite activar o desactivar el audio diario sin cambiar las demás opciones. Los datos se guardan en la tabla `audio_preferences`, creada automáticamente sin borrar los datos anteriores.
+
+### Actualizar con `systemd` en Fedora (después de integrar la rama de desarrollo)
+
+**No ejecutes una segunda instancia con `bash scripts/iniciar_linux.sh` si el servicio ya está activo.** Antes de actualizar, realiza una copia de seguridad de `data/news_bot.sqlite3` con el mecanismo de backup de SQLite. Luego:
+
+```bash
+cd ~/Documentos/bot-noticias/bot-noticia-telegram
+git pull --ff-only origin main
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+systemctl --user restart bot-noticias.service
+systemctl --user status bot-noticias.service
+journalctl --user -u bot-noticias.service -n 30 --no-pager
+```
+
+**Nota:** el desarrollo de esta etapa se hace en una rama aparte; no actualices `main` ni reinicies el servicio hasta aprobar la integración.

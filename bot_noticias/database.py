@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 
 from .news import DEFAULT_TOPICS, TOPICS
+from .audio_settings import AUDIO_MODES, AUDIO_VOICES, AUDIO_RATES, DEFAULT_AUDIO_SETTINGS
 
 
 class Database:
@@ -46,6 +47,16 @@ class Database:
                     PRIMARY KEY(chat_id, topic),
                     FOREIGN KEY(chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS audio_preferences (
+                    chat_id INTEGER PRIMARY KEY,
+                    audio_mode TEXT NOT NULL DEFAULT 'normal'
+                        CHECK (audio_mode IN ('rapido', 'normal', 'detallado')),
+                    voice_key TEXT NOT NULL DEFAULT 'predeterminada'
+                        CHECK (voice_key IN ('predeterminada', 'salome', 'gonzalo')),
+                    rate_key TEXT NOT NULL DEFAULT 'normal'
+                        CHECK (rate_key IN ('lenta', 'normal', 'rapida')),
+                    FOREIGN KEY(chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS delivered (
                     chat_id INTEGER NOT NULL,
                     fingerprint TEXT NOT NULL,
@@ -76,6 +87,7 @@ class Database:
                     "INSERT INTO preferences(chat_id, topic) VALUES (?, ?)",
                     [(chat_id, topic) for topic in DEFAULT_TOPICS],
                 )
+            conn.execute("INSERT OR IGNORE INTO audio_preferences(chat_id) VALUES (?)", (chat_id,))
             # Para usuarios existentes, preserva los temas que eligieron.
 
     def subscribers(self) -> list[dict]:
@@ -125,6 +137,27 @@ class Database:
     def set_voice_enabled(self, chat_id: int, enabled: bool) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE subscribers SET voice_enabled = ? WHERE chat_id = ?", (int(enabled), chat_id))
+
+    def audio_settings(self, chat_id: int) -> dict | None:
+        """Crea valores por defecto para suscriptores antiguos sin perder datos."""
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM subscribers WHERE chat_id = ?", (chat_id,)).fetchone():
+                return None
+            conn.execute("INSERT OR IGNORE INTO audio_preferences(chat_id) VALUES (?)", (chat_id,))
+            row = conn.execute(
+                "SELECT audio_mode, voice_key, rate_key FROM audio_preferences WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            return dict(row) if row else DEFAULT_AUDIO_SETTINGS.copy()
+
+    def set_audio_setting(self, chat_id: int, setting: str, value: str) -> None:
+        allowed = {"audio_mode": AUDIO_MODES, "voice_key": AUDIO_VOICES, "rate_key": AUDIO_RATES}
+        if setting not in allowed or value not in allowed[setting]:
+            raise ValueError("Preferencia de audio inválida")
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM subscribers WHERE chat_id = ?", (chat_id,)).fetchone():
+                raise ValueError("Suscriptor no registrado")
+            conn.execute("INSERT OR IGNORE INTO audio_preferences(chat_id) VALUES (?)", (chat_id,))
+            conn.execute(f"UPDATE audio_preferences SET {setting} = ? WHERE chat_id = ?", (value, chat_id))
 
     def was_delivered(self, chat_id: int, fingerprint: str) -> bool:
         with self.connect() as conn:
