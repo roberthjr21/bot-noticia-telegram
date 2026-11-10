@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from html import escape
 import logging
 
@@ -16,6 +16,10 @@ from .config import Config, validate_time
 from .database import Database
 from .news import TOPICS, NewsItem, get_news
 from .voice import send_spoken_news
+from .summaries import format_news_message, format_weekly_message
+from .weekly import choose_weekly
+from .alerts import choose_alert, in_quiet_hours, alert_message
+from .diagnostics import diagnostic_text
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +60,11 @@ def main_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⏰ Hora del resumen", callback_data="menu:time")],
         [InlineKeyboardButton("🎙 Audio y voces", callback_data="menu:audio"),
          InlineKeyboardButton("🎧 Escuchar noticias", callback_data="news:listen")],
+        [InlineKeyboardButton("🔔 Alertas importantes", callback_data="menu:alerts"),
+         InlineKeyboardButton("📅 Resumen semanal", callback_data="menu:weekly")],
         [InlineKeyboardButton("📋 Mi configuración", callback_data="menu:status"),
-         InlineKeyboardButton("⏯ Pausar / activar", callback_data="menu:toggle")],
+         InlineKeyboardButton("🩺 Diagnóstico", callback_data="menu:diagnostics")],
+        [InlineKeyboardButton("⏯ Pausar / activar", callback_data="menu:toggle")],
     ])
 
 
@@ -87,6 +94,46 @@ def times_keyboard(current_time: str) -> InlineKeyboardMarkup:
     ])
 
 
+def alerts_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔕 Desactivar alertas" if enabled else "🔔 Activar alertas",
+                              callback_data="alerts:toggle")],
+        [InlineKeyboardButton("🏠 Volver al menú", callback_data="menu:home")],
+    ])
+
+
+def weekly_keyboard(enabled: bool, weekly_time: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏸ Desactivar semanal" if enabled else "📅 Activar semanal",
+                              callback_data="weekly:toggle")],
+        [InlineKeyboardButton(("✅ " if weekly_time == clock else "🕒 ") + clock,
+                              callback_data=f"weekly:time:{clock}") for clock in ("12:00", "18:00", "21:00")],
+        [InlineKeyboardButton("📖 Ver resumen disponible", callback_data="weekly:preview")],
+        [InlineKeyboardButton("🏠 Volver al menú", callback_data="menu:home")],
+    ])
+
+
+def alerts_text(enabled: bool) -> str:
+    return (
+        "<b>🔔 Alertas de noticias destacadas</b>\n\n"
+        f"Estado: {'🟢 Activadas' if enabled else '🔕 Desactivadas'}\n"
+        "Hasta 2 alertas al día, solo entre las 07:00 y las 21:59 (hora del bot). "
+        "Se eligen automáticamente por palabras clave y actualidad; "
+        "no son avisos de emergencia ni verificaciones independientes."
+    )
+
+
+def weekly_text(enabled: bool, weekly_time: str, timezone_name: str) -> str:
+    return (
+        "<b>📅 Resumen semanal</b>\n\n"
+        f"Estado: {'🟢 Activado' if enabled else '⏸ Desactivado'}\n"
+        f"Envío: domingo a las <b>{escape(weekly_time)}</b> ({escape(timezone_name)}).\n"
+        "Incluye noticias guardadas por el bot durante los últimos 7 días. "
+        "Al activar la función por primera vez, el historial puede ser insuficiente. "
+        "Usa /semanal HH:MM para cambiar la hora."
+    )
+
+
 def format_topics(active: list[str]) -> str:
     return ", ".join(f"{TOPICS[t][0]} {TOPICS[t][1]}" for t in active) or "Ninguna"
 
@@ -97,6 +144,7 @@ def status_text(db: Database, config: Config, chat_id: int) -> str:
         return "Primero envía /start para configurar tu resumen."
     status = "🟢 Activado" if subscriber["enabled"] else "⏸ Pausado"
     audio = db.audio_settings(chat_id)
+    features = db.features(chat_id)
     return (
         "<b>⚙️ Tu configuración</b>\n\n"
         f"Estado: {status}\n"
@@ -105,6 +153,9 @@ def status_text(db: Database, config: Config, chat_id: int) -> str:
         f"Voz: {escape(AUDIO_VOICES[audio['voice_key']][0])}\n"
         f"Velocidad: {escape(AUDIO_RATES[audio['rate_key']][0])}\n"
         f"Envío diario: <b>{subscriber['daily_time']}</b>\n"
+        f"Alertas: {'🔔 Activadas' if features['alerts_enabled'] else '🔕 Desactivadas'}\n"
+        f"Semanal: {'📅 Activado' if features['weekly_enabled'] else '⏸ Desactivado'} "
+        f"(domingo {escape(features['weekly_time'])})\n"
         f"Zona horaria: <b>{escape(config.timezone_name)}</b>\n"
         f"Temas: {escape(format_topics(db.topics(chat_id)))}\n\n"
         "Puedes cambiar la hora con <code>/hora 08:00</code>."
@@ -122,6 +173,9 @@ def schedule_user(app: Application, chat_id: int) -> None:
     for job in queue.get_jobs_by_name(name):
         job.schedule_removal()
     subscriber = db.get(chat_id)
+    weekly_name = f"weekly:{chat_id}"
+    for job in queue.get_jobs_by_name(weekly_name):
+        job.schedule_removal()
     if subscriber and subscriber["enabled"]:
         hour, minute = map(int, subscriber["daily_time"].split(":"))
         queue.run_daily(
@@ -132,22 +186,23 @@ def schedule_user(app: Application, chat_id: int) -> None:
             data=chat_id,
             job_kwargs={"misfire_grace_time": 3600, "coalesce": True, "max_instances": 1},
         )
+        features = db.features(chat_id)
+        if features["weekly_enabled"]:
+            hour, minute = map(int, features["weekly_time"].split(":"))
+            queue.run_daily(
+                send_weekly_job,
+                time(hour=hour, minute=minute, tzinfo=config.timezone),
+                days=(0,),  # python-telegram-bot: domingo = 0
+                chat_id=chat_id,
+                name=weekly_name,
+                data=chat_id,
+                job_kwargs={"misfire_grace_time": 3600, "coalesce": True, "max_instances": 1},
+            )
 
 
 def message_for_items(items: list[NewsItem], config: Config, scheduled: bool) -> str:
-    date_label = datetime.now(config.timezone).strftime("%d/%m/%Y")
-    headline = "☀️ <b>Tu resumen diario</b>" if scheduled else "🗞 <b>Noticias para ti</b>"
-    lines = [f"{headline} · {date_label}", f"<i>{len(items)} noticias recientes • Zona: {escape(config.timezone_name)}</i>"]
-    for i, item in enumerate(items, 1):
-        emoji, label, _ = TOPICS[item.topic]
-        lines.append(f"\n<b>{i}. {escape(item.title)}</b>")
-        lines.append(f"{emoji} {escape(label)} · {escape(item.source)}")
-        if item.description:
-            lines.append(escape(item.description))
-        # URL obtenida del RSS y validada como HTTPS. Nunca se forma con texto de usuarios.
-        lines.append(f'<a href="{escape(item.url, quote=True)}">🔗 Leer noticia completa</a>')
-    lines.append("\n<i>Fuente: titulares y fragmentos de Google News RSS. Abre los enlaces para verificar detalles.</i>")
-    return "\n".join(lines)
+    """Conserva la interfaz antigua; delega el formato trazable a summaries.py."""
+    return format_news_message(items, config.timezone_name, scheduled=scheduled)
 
 
 async def send_digest(
@@ -166,6 +221,11 @@ async def send_digest(
         limit=5,
         excluded_fingerprints=db.delivered_fingerprints(chat_id) if scheduled else None,
     )
+    context.application.bot_data["rss_status"] = {
+        "at": datetime.now(config.timezone).strftime("%d/%m/%Y %H:%M"),
+        "feeds_ok": result.feeds_ok,
+        "feeds_failed": result.feeds_failed,
+    }
     if result.feeds_ok == 0:
         await context.bot.send_message(
             chat_id, "⚠️ No pude conectarme a las fuentes de noticias. "
@@ -187,8 +247,10 @@ async def send_digest(
         disable_web_page_preview=True,
         reply_markup=main_keyboard() if not scheduled else None,
     )
+    db.record_news(chat_id, items)
     if scheduled:
         db.mark_delivered(chat_id, [item.fingerprint for item in items])
+        db.mark_delivery(chat_id, "daily", datetime.now(config.timezone).date().isoformat())
 
     subscriber = db.get(chat_id)
     if force_audio or (subscriber and subscriber.get("voice_enabled")):
@@ -229,6 +291,119 @@ async def send_daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Error preparando el resumen para %s", chat_id)
 
 
+async def send_weekly_preview(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Envía un resumen del historial sin alterar la programación ni el control de duplicados."""
+    db = get_db(context)
+    config = get_config(context)
+    topics = set(db.topics(chat_id))
+    rows = [row for row in db.weekly_news(chat_id) if row["topic"] in topics]
+    selected = choose_weekly(rows, limit=7)
+    if len(selected) < 3:
+        await context.bot.send_message(
+            chat_id, "📭 Todavía no hay suficientes noticias guardadas para un resumen semanal "
+                     "(mínimo 3). Se acumularán con los próximos envíos."
+        )
+        return
+    await context.bot.send_message(
+        chat_id=chat_id, text=format_weekly_message(selected, config.timezone_name),
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+    )
+    return selected
+
+
+async def send_weekly_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.job.data
+    db = get_db(context)
+    config = get_config(context)
+    subscriber = db.get(chat_id)
+    features = db.features(chat_id)
+    if not subscriber or not subscriber["enabled"] or not features["weekly_enabled"]:
+        return
+    local_now = datetime.now(config.timezone)
+    # Clave de la semana que termina este domingo.
+    key = f"{local_now.isocalendar().year}-W{local_now.isocalendar().week:02d}"
+    if not db.claim_delivery(chat_id, "weekly", key):
+        return
+    try:
+        rows = await send_weekly_preview(context, chat_id)
+        db.mark_delivery(chat_id, "weekly", key)
+        if rows and subscriber.get("voice_enabled"):
+            try:
+                settings = db.audio_settings(chat_id)
+                items = [
+                    NewsItem(
+                        row["topic"], row["title"], row["url"], row["source"],
+                        datetime.fromisoformat(row["published_at"]),
+                        row["description"], row["fingerprint"],
+                    )
+                    for row in rows[:5]
+                ]
+                await send_spoken_news(
+                    context, chat_id, items, scheduled=False,
+                    voice_name=resolve_voice(settings["voice_key"], config.tts_voice),
+                    mode=settings["audio_mode"], rate=AUDIO_RATES[settings["rate_key"]][1],
+                    intro="Este es tu resumen semanal de noticias.",
+                )
+            except Exception:
+                logger.exception("No se pudo generar el audio semanal para %s", chat_id)
+                await context.bot.send_message(
+                    chat_id, "⚠️ No pude generar el audio semanal. Ya tienes el resumen en texto."
+                )
+    except Forbidden:
+        db.release_delivery(chat_id, "weekly", key)
+        db.set_enabled(chat_id, False)
+        schedule_user(context.application, chat_id)
+    except Exception:
+        db.release_delivery(chat_id, "weekly", key)
+        logger.exception("Error enviando resumen semanal a %s", chat_id)
+
+
+async def send_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Una consulta RSS por ciclo, compartida entre suscriptores con alertas."""
+    db = get_db(context)
+    config = get_config(context)
+    local_now = datetime.now(config.timezone)
+    if in_quiet_hours(local_now):
+        return
+    subscribers = [
+        sub for sub in db.subscribers()
+        if sub["enabled"] and db.features(sub["chat_id"])["alerts_enabled"]
+    ]
+    if not subscribers:
+        return
+    topics = list(dict.fromkeys(topic for sub in subscribers for topic in db.topics(sub["chat_id"])))
+    result = await get_news(topics, limit=50, max_age_hours=4)
+    context.application.bot_data["rss_status"] = {
+        "at": local_now.strftime("%d/%m/%Y %H:%M"),
+        "feeds_ok": result.feeds_ok, "feeds_failed": result.feeds_failed,
+    }
+    if not result.feeds_ok:
+        return
+    midnight_utc = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    for sub in subscribers:
+        chat_id = sub["chat_id"]
+        if db.sent_count_since(chat_id, "alert", midnight_utc) >= 2:
+            continue
+        item = choose_alert(result.items, db.topics(chat_id), db.delivered_fingerprints(chat_id), datetime.now(timezone.utc))
+        if item is None or not db.claim_delivery(chat_id, "alert", item.fingerprint):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=alert_message(item),
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+            db.record_news(chat_id, [item])
+            db.mark_delivered(chat_id, [item.fingerprint])
+            db.mark_delivery(chat_id, "alert", item.fingerprint)
+        except Forbidden:
+            db.release_delivery(chat_id, "alert", item.fingerprint)
+            db.set_feature(chat_id, "alerts_enabled", False)
+            logger.warning("El usuario %s bloqueó el bot; alertas desactivadas.", chat_id)
+        except Exception:
+            db.release_delivery(chat_id, "alert", item.fingerprint)
+            logger.exception("Error enviando alerta a %s", chat_id)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update, context):
         return
@@ -243,6 +418,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Tu horario inicial es <b>08:00 (Colombia)</b> si no has cambiado la configuración.\n\n"
         "🎯 Puedes escoger tus categorías, cambiar la hora y consultar noticias cuando quieras. "
         "Activa /voz para recibir también los resúmenes narrados. "
+        "También puedes activar alertas destacadas y un resumen semanal desde el menú. "
         "Todo desde los botones de abajo.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard(),
@@ -258,6 +434,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/noticias — noticias recientes de tus temas\n"
         "/voz — activar o desactivar audios automáticos\n"
         "/audio — elegir modo, voz y velocidad\n"
+        "/alertas — configurar alertas destacadas\n"
+        "/semanal — configurar resumen semanal\n"
+        "/diagnostico — consultar estado del bot\n"
         "/escuchar — recibir noticias en audio ahora\n"
         "/categoria ia — consultar una categoría\n"
         "/temas — activar o desactivar categorías\n"
@@ -317,6 +496,69 @@ async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         audio_text(db.audio_settings(chat_id), bool(subscriber["voice_enabled"]), get_config(context).tts_voice),
         parse_mode=ParseMode.HTML,
         reply_markup=audio_keyboard(db.audio_settings(chat_id), bool(subscriber["voice_enabled"])),
+    )
+
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
+    db = get_db(context)
+    chat_id = update.effective_chat.id
+    if not db.get(chat_id):
+        await update.message.reply_text("Primero envía /start.")
+        return
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "activar"):
+        db.set_feature(chat_id, "alerts_enabled", True)
+    elif arg in ("off", "desactivar"):
+        db.set_feature(chat_id, "alerts_enabled", False)
+    elif arg:
+        await update.message.reply_text("Usa /alertas, /alertas on o /alertas off.")
+        return
+    enabled = bool(db.features(chat_id)["alerts_enabled"])
+    await update.message.reply_text(
+        alerts_text(enabled), parse_mode=ParseMode.HTML, reply_markup=alerts_keyboard(enabled)
+    )
+
+
+async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
+    db = get_db(context)
+    chat_id = update.effective_chat.id
+    if not db.get(chat_id):
+        await update.message.reply_text("Primero envía /start.")
+        return
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "activar"):
+        db.set_feature(chat_id, "weekly_enabled", True)
+    elif arg in ("off", "desactivar"):
+        db.set_feature(chat_id, "weekly_enabled", False)
+    elif arg in ("ver", "ahora"):
+        await send_weekly_preview(context, chat_id)
+        return
+    elif arg:
+        try:
+            db.set_feature(chat_id, "weekly_time", validate_time(arg))
+        except ValueError:
+            await update.message.reply_text("Usa /semanal, /semanal on, /semanal off, /semanal ver o /semanal HH:MM.")
+            return
+    schedule_user(context.application, chat_id)
+    settings = db.features(chat_id)
+    await update.message.reply_text(
+        weekly_text(bool(settings["weekly_enabled"]), settings["weekly_time"], get_config(context).timezone_name),
+        parse_mode=ParseMode.HTML,
+        reply_markup=weekly_keyboard(bool(settings["weekly_enabled"]), settings["weekly_time"]),
+    )
+
+
+async def diagnostic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
+    db = get_db(context)
+    await update.message.reply_text(
+        diagnostic_text(db, update.effective_chat.id, context.application, get_config(context).timezone_name),
+        parse_mode=ParseMode.HTML, reply_markup=main_keyboard(),
     )
 
 
@@ -524,6 +766,38 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
             reply_markup=audio_keyboard(settings, enabled),
         )
+    elif data == "menu:alerts" or data.startswith("alerts:"):
+        if data == "alerts:toggle":
+            db.set_feature(chat_id, "alerts_enabled", not bool(db.features(chat_id)["alerts_enabled"]))
+        enabled = bool(db.features(chat_id)["alerts_enabled"])
+        await callback.edit_message_text(
+            alerts_text(enabled), parse_mode=ParseMode.HTML, reply_markup=alerts_keyboard(enabled),
+        )
+    elif data == "menu:weekly" or data.startswith("weekly:"):
+        if data == "weekly:toggle":
+            db.set_feature(chat_id, "weekly_enabled", not bool(db.features(chat_id)["weekly_enabled"]))
+            schedule_user(context.application, chat_id)
+        elif data.startswith("weekly:time:"):
+            try:
+                db.set_feature(chat_id, "weekly_time", validate_time(data.split(":", 2)[2]))
+            except ValueError:
+                await callback.message.reply_text("Hora semanal inválida.")
+                return
+            schedule_user(context.application, chat_id)
+        elif data == "weekly:preview":
+            await send_weekly_preview(context, chat_id)
+            return
+        settings = db.features(chat_id)
+        await callback.edit_message_text(
+            weekly_text(bool(settings["weekly_enabled"]), settings["weekly_time"], config.timezone_name),
+            parse_mode=ParseMode.HTML,
+            reply_markup=weekly_keyboard(bool(settings["weekly_enabled"]), settings["weekly_time"]),
+        )
+    elif data == "menu:diagnostics":
+        await callback.edit_message_text(
+            diagnostic_text(db, chat_id, context.application, config.timezone_name),
+            parse_mode=ParseMode.HTML, reply_markup=main_keyboard(),
+        )
     elif data == "menu:status":
         await callback.edit_message_text(
             status_text(db, config, chat_id),
@@ -553,6 +827,9 @@ async def post_init(application: Application) -> None:
         BotCommand("noticias", "Leer noticias recientes"),
         BotCommand("voz", "Activar o desactivar narración"),
         BotCommand("audio", "Configurar voz, modo y velocidad"),
+        BotCommand("alertas", "Alertas de novedades destacadas"),
+        BotCommand("semanal", "Resumen de los últimos 7 días"),
+        BotCommand("diagnostico", "Diagnóstico del bot"),
         BotCommand("escuchar", "Escuchar noticias en audio"),
         BotCommand("temas", "Elegir temas"),
         BotCommand("hora", "Cambiar la hora diaria"),
@@ -563,6 +840,10 @@ async def post_init(application: Application) -> None:
     ])
     for subscriber in db.subscribers():
         schedule_user(application, subscriber["chat_id"])
+    application.job_queue.run_repeating(
+        send_alerts_job, interval=1800, first=180, name="alerts:scan",
+        job_kwargs={"coalesce": True, "max_instances": 1},
+    )
     logger.info("Cargadas %d suscripciones de SQLite", len(db.subscribers()))
 
 
@@ -587,6 +868,9 @@ def create_application(config: Config, database: Database) -> Application:
     app.add_handler(CommandHandler(["noticias", "ahora"], news_command))
     app.add_handler(CommandHandler("voz", voice_command))
     app.add_handler(CommandHandler("audio", audio_command))
+    app.add_handler(CommandHandler("alertas", alerts_command))
+    app.add_handler(CommandHandler("semanal", weekly_command))
+    app.add_handler(CommandHandler("diagnostico", diagnostic_command))
     app.add_handler(CommandHandler("escuchar", listen_command))
     app.add_handler(CommandHandler("categoria", category_command))
     app.add_handler(CommandHandler("temas", topics_command))
@@ -596,6 +880,6 @@ def create_application(config: Config, database: Database) -> Application:
     app.add_handler(CommandHandler("reanudar", resume_command))
     app.add_handler(CommandHandler("fuentes", sources_command))
     app.add_handler(CommandHandler("miid", id_command))
-    app.add_handler(CallbackQueryHandler(callbacks, pattern=r"^(?:menu:|topic:|time:|news:|audio:).+"))
+    app.add_handler(CallbackQueryHandler(callbacks, pattern=r"^(?:menu:|topic:|time:|news:|audio:|alerts:|weekly:).+"))
     app.add_error_handler(error_handler)
     return app

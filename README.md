@@ -237,3 +237,71 @@ journalctl --user -u bot-noticias.service -n 30 --no-pager
 ```
 
 **Nota:** el desarrollo de esta etapa se hace en una rama aparte; no actualices `main` ni reinicies el servicio hasta aprobar la integración.
+
+
+## NewsBot v2 — resúmenes, alertas, semanal y diagnóstico
+
+> Esta sección documenta la rama de desarrollo `feature/newsbot-v2-inteligencia-alertas`. **No despliegues la rama en Fedora antes de pasar las pruebas y revisar la integración.**
+
+### Resúmenes trazables
+
+`/noticias` y los resúmenes diarios muestran «Qué se sabe» basado **solo** en título, fecha, medio y fragmento RSS de Google News. Cuando no hay fragmento, el bot lo indica. No utiliza modelos de IA ni extrae artículos completos, por lo que **no inventa explicaciones ni interpretaciones**. Cada noticia conserva el enlace a su fuente.
+
+### Alertas importantes
+
+`/alertas`, `/alertas on` y `/alertas off` permiten activar y desactivar avisos. También hay botones en el menú. **Desactivadas por defecto**.
+
+- El bot revisa RSS cada 30 minutos cuando hay suscriptores con alertas activas.
+- Solo notifica novedades de hasta 4 horas, con palabras clave relevantes y fecha/medio identificados.
+- Máximo **2 avisos diarios por chat**; silencio entre **22:00 y 06:59**, hora `BOT_TZ`.
+- No repite noticias que ya fueron enviadas automáticamente.
+- Son selecciones heurísticas, **no noticias de última hora verificadas de forma independiente**.
+
+### Resumen semanal
+
+`/semanal`, `/semanal on`, `/semanal off`, `/semanal ver` y `/semanal HH:MM`.
+
+- **Desactivado por defecto**. Al activarlo, el envío se programa para los **domingos a las 18:00**, ajustable por chat.
+- Utiliza el historial SQLite de noticias entregadas durante los últimos siete días; selecciona hasta siete artículos, procurando variedad de temas.
+- Si hay menos de tres noticias guardadas, informa que el historial es insuficiente.
+- Si la narración diaria está activada, el resumen semanal también puede incluir audio.
+- El historial empieza a guardarse cuando esta versión se ejecute; no se reconstruye contenido pasado artificialmente.
+
+### Diagnóstico
+
+`/diagnostico` muestra programación de tareas, preferencias, número de noticias guardadas, última entrega y estado de la última consulta RSS. Respeta el control de acceso del bot; no expone tokens ni credenciales.
+
+### Seguridad, persistencia y despliegue
+
+Se crean tres tablas adicionales sin eliminar las anteriores: `subscriber_features`, `news_history` y `delivery_events`. Los nuevos envíos semanales y las alertas están desactivados por defecto. El historial y los eventos de entrega se depuran tras 45 días.
+
+**Antes de desplegar**, haz un backup consistente de SQLite y confirma que no haya cambios locales pendientes:
+
+```bash
+cd ~/Documentos/bot-noticias/bot-noticia-telegram
+git status --short
+.venv/bin/python - <<'PY'
+from bot_noticias.config import load_config
+from sqlite3 import connect
+from datetime import datetime
+from pathlib import Path
+src = load_config().database_path
+dst = src.with_name(src.stem + "-backup-" + datetime.now().strftime("%Y%m%d-%H%M%S") + src.suffix)
+with connect(src) as original, connect(dst) as backup:
+    original.backup(backup)
+print("Backup SQLite:", dst)
+PY
+```
+
+Luego de integrar la rama a `main` y confirmar el resultado del CI:
+
+```bash
+git switch main
+git pull --ff-only origin main
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+systemctl --user restart bot-noticias.service
+journalctl --user -u bot-noticias.service -n 50 --no-pager
+```
+
+**No ejecutes otra copia de `main.py` con el mismo token** mientras `bot-noticias.service` esté activo: Telegram provocará `Conflict`. El equipo debe permanecer encendido y conectado para realizar envíos.
