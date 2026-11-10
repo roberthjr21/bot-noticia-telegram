@@ -116,6 +116,33 @@ DATA_DIR=data
 
 El bot intenta seleccionar **una noticia por tema por ronda** para mejorar la variedad. Los resultados y su frescura dependen de Google News RSS; cuando hay noticias sin fecha verificable o más antiguas de 72 horas, el bot las descarta. Los fragmentos no son resúmenes originales y pueden estar vacíos.
 
+## 🔊 Escuchar noticias en Telegram
+
+- Envía `/escuchar` para recibir ahora las noticias en texto y audio.
+- Envía `/voz` para activar o desactivar el audio **automático** junto al resumen diario. Se guarda en SQLite, incluso tras reiniciar el bot.
+- También puedes usar los botones **🎧 Escuchar noticias** y **🔊 Activar / desactivar voz**.
+- El bot narra hasta cinco titulares y los fragmentos disponibles del RSS, **no el contenido completo de los artículos**.
+- Por defecto utiliza la voz colombiana `es-CO-SalomeNeural`. Para cambiarla a una voz masculina, añade `TTS_VOICE=es-CO-GonzaloNeural` a tu archivo privado `.env`.
+- La síntesis se realiza en línea con **edge-tts** (servicio de voz de Microsoft), por lo que el texto narrado se envía a ese servicio y requiere internet. No necesita clave de API.
+- Con `ffmpeg` instalado se envían notas de voz OGG/Opus; sin `ffmpeg`, el bot envía un audio MP3 reproducible en Telegram.
+- Si falla la voz, las noticias siguen llegando en texto. La función de voz está desactivada por defecto.
+
+**Actualizar en Fedora Linux:**
+
+```bash
+cd ~/Documentos/bot-noticias/bot-noticia-telegram
+git pull --ff-only origin main
+.venv/bin/python -m pip install -r requirements.txt
+sudo dnf install -y ffmpeg-free  # Opcional: nota de voz OGG/Opus; MP3 funciona sin ffmpeg
+bash scripts/iniciar_linux.sh
+```
+
+Si ya tienes un servicio systemd configurado, reinícialo en lugar de iniciar una segunda copia:
+
+```bash
+systemctl --user restart bot-noticias.service
+```
+
 ## 5. Subir el código a tu repositorio GitHub
 
 Repositorio destino: [roberthjr21/bot-noticia-telegram](https://github.com/roberthjr21/bot-noticia-telegram)

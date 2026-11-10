@@ -17,6 +17,7 @@ class Config:
     default_time: str
     database_path: Path
     allowed_user_ids: frozenset[int]
+    tts_voice: str = "es-CO-SalomeNeural"
 
 
 def validate_time(value: str) -> str:
@@ -54,4 +55,5 @@ def load_config() -> Config:
     if not data_dir.is_absolute():
         data_dir = root / data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
-    return Config(token, timezone, tz_name, default_time, data_dir / "news_bot.sqlite3", allowed)
+    tts_voice = os.getenv("TTS_VOICE", "es-CO-SalomeNeural").strip() or "es-CO-SalomeNeural"
+    return Config(token, timezone, tz_name, default_time, data_dir / "news_bot.sqlite3", allowed, tts_voice)

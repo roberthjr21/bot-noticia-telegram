@@ -14,6 +14,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from .config import Config, validate_time
 from .database import Database
 from .news import TOPICS, NewsItem, get_news
+from .voice import send_spoken_news
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ def main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗞 Ver noticias ahora", callback_data="news:all")],
         [InlineKeyboardButton("🎯 Mis temas", callback_data="menu:topics"),
          InlineKeyboardButton("⏰ Hora del resumen", callback_data="menu:time")],
+        [InlineKeyboardButton("🔊 Activar / desactivar voz", callback_data="menu:voice"),
+         InlineKeyboardButton("🎧 Escuchar noticias", callback_data="news:listen")],
         [InlineKeyboardButton("📋 Mi configuración", callback_data="menu:status"),
          InlineKeyboardButton("⏯ Pausar / activar", callback_data="menu:toggle")],
     ])
@@ -95,6 +98,7 @@ def status_text(db: Database, config: Config, chat_id: int) -> str:
     return (
         "<b>⚙️ Tu configuración</b>\n\n"
         f"Estado: {status}\n"
+        f"Lectura en voz alta: {'🔊 Activada' if subscriber.get('voice_enabled') else '🔇 Desactivada'}\n"
         f"Envío diario: <b>{subscriber['daily_time']}</b>\n"
         f"Zona horaria: <b>{escape(config.timezone_name)}</b>\n"
         f"Temas: {escape(format_topics(db.topics(chat_id)))}\n\n"
@@ -147,6 +151,7 @@ async def send_digest(
     topics: list[str],
     *,
     scheduled: bool = False,
+    force_audio: bool = False,
 ) -> None:
     db = get_db(context)
     config = get_config(context)
@@ -179,6 +184,20 @@ async def send_digest(
     )
     if scheduled:
         db.mark_delivered(chat_id, [item.fingerprint for item in items])
+
+    subscriber = db.get(chat_id)
+    if force_audio or (subscriber and subscriber.get("voice_enabled")):
+        try:
+            await send_spoken_news(
+                context, chat_id, items, scheduled=scheduled, voice_name=config.tts_voice
+            )
+        except Exception:
+            logger.exception("No se pudo generar o enviar el audio para %s", chat_id)
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ No pude generar el audio ahora. Ya tienes las noticias en texto. "
+                "Comprueba la conexión a internet e inténtalo de nuevo con /escuchar.",
+            )
 
 
 async def send_daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -214,6 +233,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Te envío un resumen con las noticias más recientes de los temas que te interesan. "
         "Tu horario inicial es <b>08:00 (Colombia)</b> si no has cambiado la configuración.\n\n"
         "🎯 Puedes escoger tus categorías, cambiar la hora y consultar noticias cuando quieras. "
+        "Activa /voz para recibir también los resúmenes narrados. "
         "Todo desde los botones de abajo.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard(),
@@ -227,6 +247,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>📚 Comandos de NewsBot</b>\n\n"
         "/start — comenzar y mostrar botones\n"
         "/noticias — noticias recientes de tus temas\n"
+        "/voz — activar o desactivar audios automáticos\n"
+        "/escuchar — recibir noticias en audio ahora\n"
         "/categoria ia — consultar una categoría\n"
         "/temas — activar o desactivar categorías\n"
         "/hora 08:00 — cambiar hora diaria (24 h)\n"
@@ -252,6 +274,36 @@ async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.message.reply_text("🔎 Buscando noticias recientes en tus categorías...")
     await send_digest(context, chat_id, db.topics(chat_id))
+
+
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
+    db = get_db(context)
+    chat_id = update.effective_chat.id
+    subscriber = db.get(chat_id)
+    if not subscriber:
+        await update.message.reply_text("Primero envía /start para configurar el bot.")
+        return
+    enabled = not bool(subscriber.get("voice_enabled"))
+    db.set_voice_enabled(chat_id, enabled)
+    await update.message.reply_text(
+        "🔊 Lectura en voz alta activada. Tus noticias llegarán en texto y audio."
+        if enabled else "🔇 Lectura en voz alta desactivada. Seguirás recibiendo noticias en texto.",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def listen_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
+    db = get_db(context)
+    chat_id = update.effective_chat.id
+    if not db.get(chat_id):
+        await update.message.reply_text("Primero envía /start para configurar el bot.")
+        return
+    await update.message.reply_text("🎧 Preparando tus noticias narradas. Puede tardar unos segundos...")
+    await send_digest(context, chat_id, db.topics(chat_id), force_audio=True)
 
 
 async def category_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -415,6 +467,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
             reply_markup=times_keyboard(current),
         )
+    elif data == "menu:voice":
+        enabled = not bool(db.get(chat_id).get("voice_enabled"))
+        db.set_voice_enabled(chat_id, enabled)
+        await callback.edit_message_text(
+            "🔊 Lectura en voz alta activada: recibirás noticias en texto y audio."
+            if enabled else "🔇 Lectura en voz alta desactivada: solo recibirás texto.",
+            reply_markup=main_keyboard(),
+        )
     elif data == "menu:status":
         await callback.edit_message_text(
             status_text(db, config, chat_id),
@@ -432,6 +492,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "news:all":
         await callback.message.reply_text("🔎 Buscando noticias recientes...")
         await send_digest(context, chat_id, db.topics(chat_id))
+    elif data == "news:listen":
+        await callback.message.reply_text("🎧 Preparando las noticias narradas...")
+        await send_digest(context, chat_id, db.topics(chat_id), force_audio=True)
 
 
 async def post_init(application: Application) -> None:
@@ -439,6 +502,8 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand("start", "Iniciar y abrir el menú"),
         BotCommand("noticias", "Leer noticias recientes"),
+        BotCommand("voz", "Activar o desactivar narración"),
+        BotCommand("escuchar", "Escuchar noticias en audio"),
         BotCommand("temas", "Elegir temas"),
         BotCommand("hora", "Cambiar la hora diaria"),
         BotCommand("estado", "Ver mi configuración"),
@@ -470,6 +535,8 @@ def create_application(config: Config, database: Database) -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler(["ayuda", "help"], help_command))
     app.add_handler(CommandHandler(["noticias", "ahora"], news_command))
+    app.add_handler(CommandHandler("voz", voice_command))
+    app.add_handler(CommandHandler("escuchar", listen_command))
     app.add_handler(CommandHandler("categoria", category_command))
     app.add_handler(CommandHandler("temas", topics_command))
     app.add_handler(CommandHandler("hora", time_command))

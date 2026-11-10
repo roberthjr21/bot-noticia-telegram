@@ -37,6 +37,7 @@ class Database:
                     user_id INTEGER NOT NULL,
                     daily_time TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                    voice_enabled INTEGER NOT NULL DEFAULT 0 CHECK (voice_enabled IN (0, 1)),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS preferences (
@@ -53,6 +54,13 @@ class Database:
                     FOREIGN KEY(chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
                 );
             """)
+            # Migración no destructiva: conserva las suscripciones existentes.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(subscribers)")}
+            if "voice_enabled" not in columns:
+                conn.execute(
+                    "ALTER TABLE subscribers ADD COLUMN voice_enabled INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (voice_enabled IN (0, 1))"
+                )
 
     def subscribe(self, chat_id: int, user_id: int, default_time: str) -> None:
         with self.connect() as conn:
@@ -113,6 +121,10 @@ class Database:
     def set_enabled(self, chat_id: int, enabled: bool) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE subscribers SET enabled = ? WHERE chat_id = ?", (int(enabled), chat_id))
+
+    def set_voice_enabled(self, chat_id: int, enabled: bool) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE subscribers SET voice_enabled = ? WHERE chat_id = ?", (int(enabled), chat_id))
 
     def was_delivered(self, chat_id: int, fingerprint: str) -> bool:
         with self.connect() as conn:
