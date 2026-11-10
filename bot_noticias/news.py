@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import html
+from html.parser import HTMLParser
 import logging
 import re
 from typing import Iterable
@@ -44,6 +45,7 @@ class NewsItem:
     published: datetime | None
     description: str
     fingerprint: str
+    related_headlines: tuple[str, ...] = ()
 
 
 def clean_text(raw: str | None, max_chars: int = 220) -> str:
@@ -66,6 +68,76 @@ def normalize_title(title: str) -> str:
 
 def fingerprint_for(title: str) -> str:
     return hashlib.sha256(normalize_title(title).encode("utf-8")).hexdigest()
+
+
+
+class _RSSDescriptionParser(HTMLParser):
+    """Separa párrafos y enlaces dentro del HTML incluido en un RSS."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.paragraphs: list[str] = []
+        self.links: list[str] = []
+        self._paragraph: list[str] | None = None
+        self._link: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "p":
+            self._paragraph = []
+        elif tag == "a":
+            self._link = []
+
+    def handle_data(self, data: str) -> None:
+        if self._paragraph is not None:
+            self._paragraph.append(data)
+        if self._link is not None:
+            self._link.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "p" and self._paragraph is not None:
+            self.paragraphs.append(" ".join(self._paragraph))
+            self._paragraph = None
+        elif tag == "a" and self._link is not None:
+            self.links.append(" ".join(self._link))
+            self._link = None
+
+
+def rss_details(raw: str | None, title: str, source: str) -> tuple[str, tuple[str, ...]]:
+    """No trata listas de enlaces de Google News como resúmenes de artículos."""
+    if not raw:
+        return "", ()
+    markup = html.unescape(raw)
+    parser = _RSSDescriptionParser()
+    parser.feed(markup)
+    normalized_title = normalize_title(title)
+    is_link_list = "<li" in markup.lower() or "<ol" in markup.lower()
+    candidates = parser.paragraphs if parser.paragraphs else ([] if is_link_list else [markup])
+    excerpt = ""
+    for candidate in candidates:
+        candidate_text = clean_text(candidate, 250)
+        normalized = normalize_title(candidate_text)
+        if candidate_text and normalized_title not in normalized and normalized not in normalized_title:
+            excerpt = candidate_text
+            break
+
+    related: list[str] = []
+    seen = {normalized_title}
+    for candidate in parser.links:
+        headline = clean_text(candidate, 150)
+        normalized = normalize_title(headline)
+        if not normalized or len(headline) < 12:
+            continue
+        if normalized_title in normalized or normalized in normalized_title:
+            continue
+        if source and headline.casefold().endswith(" - " + source.casefold()):
+            headline = headline[:-(len(source) + 3)].strip()
+            normalized = normalize_title(headline)
+        if normalized not in seen:
+            seen.add(normalized)
+            related.append(headline)
+        if len(related) == 2:
+            break
+    return excerpt, tuple(related)
 
 
 def rss_url(topic: str) -> str:
@@ -101,11 +173,9 @@ def parse_rss(xml_data: bytes, topic: str) -> list[NewsItem]:
                 published = published.astimezone(timezone.utc)
             except (TypeError, ValueError, IndexError):
                 pass
-        desc = clean_text(node.findtext("description"), 185)
-        if normalize_title(title) in normalize_title(desc):
-            desc = ""  # No se confunde el título duplicado con un resumen periodístico.
+        desc, related = rss_details(node.findtext("description"), title, source)
         articles.append(
-            NewsItem(topic, title, link, source, published, desc, fingerprint_for(title))
+            NewsItem(topic, title, link, source, published, desc, fingerprint_for(title), related)
         )
     return articles
 

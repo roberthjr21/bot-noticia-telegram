@@ -14,7 +14,7 @@ def article_summary(item: NewsItem) -> str:
     snippet = clean_text(item.description, 250)
     title = clean_text(item.title, 240)
     if not snippet or snippet.casefold() in title.casefold():
-        return "El RSS no incluye más detalles. Consulta la fuente original."
+        return ""
     return snippet
 
 
@@ -29,10 +29,15 @@ def format_news_message(items: list[NewsItem], timezone_name: str, *, scheduled:
         lines.append(f"{emoji} {escape(category)} · {escape(item.source)}")
         if item.published:
             lines.append(f"<i>Publicado: {item.published:%d/%m/%Y %H:%M} UTC</i>")
-        lines.append(f"📝 <b>Qué se sabe:</b> {escape(article_summary(item))}")
+        excerpt = article_summary(item)
+        if excerpt:
+            lines.append(f"📝 <b>Fragmento de la fuente:</b> {escape(excerpt)}")
+        elif item.related_headlines:
+            related = "; ".join(escape(headline) for headline in item.related_headlines)
+            lines.append(f"🗞 <b>Otros titulares relacionados en RSS:</b> {related}")
         lines.append(f'<a href="{escape(item.url, quote=True)}">🔗 Leer la fuente</a>')
-    lines.append("\n<i>Resúmenes basados en titulares y fragmentos RSS, no en artículos completos. "
-                 "Verifica los detalles en cada enlace.</i>")
+    lines.append("\n<i>Google News RSS puede incluir solo titulares o noticias relacionadas. "
+                 "No son resúmenes de artículos completos. Verifica los detalles en cada enlace.</i>")
     return "\n".join(lines)
 
 

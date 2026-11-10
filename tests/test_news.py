@@ -5,7 +5,7 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 from bot_noticias.news import (
-    NewsItem, TOPICS, clean_text, fingerprint_for, get_news, parse_rss, rss_url,
+    NewsItem, TOPICS, clean_text, fingerprint_for, get_news, parse_rss, rss_details, rss_url,
 )
 
 
@@ -25,6 +25,39 @@ class NewsTests(unittest.TestCase):
         self.assertEqual(news[0].source, "Diario Ejemplo")
         self.assertEqual(news[0].description, "Python lanza una nueva actualización.")
         self.assertEqual(news[0].published.year, 2026)
+
+    def test_related_rss_headlines_not_mistaken_for_excerpt(self):
+        xml = """<rss><channel><item>
+          <title>Nuevo videojuego anunciado - Medio A</title>
+          <link>https://news.google.com/rss/articles/abc</link>
+          <source>Medio A</source>
+          <description>&lt;ol&gt;
+            &lt;li&gt;&lt;a&gt;Nuevo videojuego anunciado&lt;/a&gt;&lt;/li&gt;
+            &lt;li&gt;&lt;a&gt;El estudio anuncia una nueva fecha de salida&lt;/a&gt;&lt;/li&gt;
+            &lt;li&gt;&lt;a&gt;El juego muestra su primer avance oficial&lt;/a&gt;&lt;/li&gt;
+          &lt;/ol&gt;</description>
+        </item></channel></rss>""".encode()
+        parsed = parse_rss(xml, "videojuegos")[0]
+        self.assertEqual(parsed.description, "")
+        self.assertEqual(parsed.related_headlines, (
+            "El estudio anuncia una nueva fecha de salida",
+            "El juego muestra su primer avance oficial",
+        ))
+
+    def test_rss_without_excerpt_or_related(self):
+        self.assertEqual(
+            rss_details("<ol><li><a>Un titular repetido</a></li></ol>",
+                        "Un titular repetido", "Medio"),
+            ("", ()),
+        )
+
+    def test_rss_paragraph_kept(self):
+        excerpt, related = rss_details(
+            "<p>El fabricante presentó dos dispositivos durante el evento.</p>",
+            "Nuevos dispositivos", "Medio",
+        )
+        self.assertEqual(excerpt, "El fabricante presentó dos dispositivos durante el evento.")
+        self.assertEqual(related, ())
 
     def test_invalid_url_ignored(self):
         xml = b'<rss><channel><item><title>x</title><link>javascript:alert(1)</link></item></channel></rss>'

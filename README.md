@@ -305,3 +305,8 @@ journalctl --user -u bot-noticias.service -n 50 --no-pager
 ```
 
 **No ejecutes otra copia de `main.py` con el mismo token** mientras `bot-noticias.service` esté activo: Telegram provocará `Conflict`. El equipo debe permanecer encendido y conectado para realizar envíos.
+
+
+### Corrección de las descripciones RSS
+
+Google News RSS suele devolver en `<description>` una lista de titulares enlazados, no un resumen del artículo. El bot ahora distingue los **fragmentos genuinos** de los **titulares relacionados**. Si solo existe un titular, muestra su enlace sin repetir «El RSS no incluye más detalles». No genera hechos ni extrae artículos completos. Esta mejora se aplica a las noticias nuevas tras actualizar y reiniciar el servicio.
