@@ -21,11 +21,14 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def speech_text(items: list[NewsItem], *, scheduled: bool = False, mode: str = "normal") -> str:
+def speech_text(
+    items: list[NewsItem], *, scheduled: bool = False, mode: str = "normal",
+    intro: str | None = None,
+) -> str:
     """Construye guion a partir de titulares y RSS; no inventa detalles ni lee URLs."""
     if mode not in AUDIO_MODES:
         raise ValueError("Modo de audio desconocido")
-    opening = (
+    opening = intro or (
         "Buenos días. Aquí tienes tu resumen diario de noticias."
         if scheduled else "Estas son las noticias más recientes para ti."
     )
@@ -61,13 +64,14 @@ async def send_spoken_news(
     voice_name: str,
     mode: str = "normal",
     rate: str = "+0%",
+    intro: str | None = None,
 ) -> None:
     """Genera y envía audio; los fallos se manejan en el llamador."""
     if rate not in {value[1] for value in AUDIO_RATES.values()}:
         raise ValueError("Velocidad de audio desconocida")
     import edge_tts  # Import diferido; las pruebas no requieren internet.
 
-    script = speech_text(items, scheduled=scheduled, mode=mode)
+    script = speech_text(items, scheduled=scheduled, mode=mode, intro=intro)
     with TemporaryDirectory(prefix="newsbot_audio_") as temp:
         mp3 = Path(temp) / "noticias.mp3"
         await asyncio.wait_for(

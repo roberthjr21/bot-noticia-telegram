@@ -2,12 +2,14 @@
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Iterator
+from typing import Iterator, Iterable
 from pathlib import Path
 import sqlite3
 
 from .news import DEFAULT_TOPICS, TOPICS
 from .audio_settings import AUDIO_MODES, AUDIO_VOICES, AUDIO_RATES, DEFAULT_AUDIO_SETTINGS
+from .config import validate_time
+from .news import NewsItem
 
 
 class Database:
@@ -57,6 +59,38 @@ class Database:
                         CHECK (rate_key IN ('lenta', 'normal', 'rapida')),
                     FOREIGN KEY(chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS subscriber_features (
+                    chat_id INTEGER PRIMARY KEY,
+                    weekly_enabled INTEGER NOT NULL DEFAULT 0 CHECK (weekly_enabled IN (0, 1)),
+                    weekly_time TEXT NOT NULL DEFAULT '18:00',
+                    alerts_enabled INTEGER NOT NULL DEFAULT 0 CHECK (alerts_enabled IN (0, 1)),
+                    FOREIGN KEY(chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS news_history (
+                    chat_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    first_seen TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, fingerprint),
+                    FOREIGN KEY(chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_news_history_time ON news_history(chat_id, first_seen);
+                CREATE TABLE IF NOT EXISTS delivery_events (
+                    chat_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('daily', 'weekly', 'alert')),
+                    delivery_key TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'sent')),
+                    created_at TEXT NOT NULL,
+                    sent_at TEXT,
+                    PRIMARY KEY(chat_id, kind, delivery_key),
+                    FOREIGN KEY(chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_delivery_events_time ON delivery_events(chat_id, kind, status, sent_at);
                 CREATE TABLE IF NOT EXISTS delivered (
                     chat_id INTEGER NOT NULL,
                     fingerprint TEXT NOT NULL,
@@ -88,6 +122,7 @@ class Database:
                     [(chat_id, topic) for topic in DEFAULT_TOPICS],
                 )
             conn.execute("INSERT OR IGNORE INTO audio_preferences(chat_id) VALUES (?)", (chat_id,))
+            conn.execute("INSERT OR IGNORE INTO subscriber_features(chat_id) VALUES (?)", (chat_id,))
             # Para usuarios existentes, preserva los temas que eligieron.
 
     def subscribers(self) -> list[dict]:
@@ -159,6 +194,121 @@ class Database:
             conn.execute("INSERT OR IGNORE INTO audio_preferences(chat_id) VALUES (?)", (chat_id,))
             conn.execute(f"UPDATE audio_preferences SET {setting} = ? WHERE chat_id = ?", (value, chat_id))
 
+    def features(self, chat_id: int) -> dict | None:
+        """Preferencias opt-in; migra los suscriptores antiguos al primer acceso."""
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM subscribers WHERE chat_id = ?", (chat_id,)).fetchone():
+                return None
+            conn.execute("INSERT OR IGNORE INTO subscriber_features(chat_id) VALUES (?)", (chat_id,))
+            row = conn.execute(
+                "SELECT weekly_enabled, weekly_time, alerts_enabled "
+                "FROM subscriber_features WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            return dict(row)
+
+    def set_feature(self, chat_id: int, name: str, value: bool | str) -> None:
+        if name not in ("weekly_enabled", "weekly_time", "alerts_enabled"):
+            raise ValueError("Preferencia desconocida")
+        if name == "weekly_time":
+            value = validate_time(str(value))
+        elif not isinstance(value, bool):
+            raise ValueError("Se requiere un valor booleano")
+        else:
+            value = int(value)
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM subscribers WHERE chat_id = ?", (chat_id,)).fetchone():
+                raise ValueError("Suscriptor inexistente")
+            conn.execute("INSERT OR IGNORE INTO subscriber_features(chat_id) VALUES (?)", (chat_id,))
+            conn.execute(f"UPDATE subscriber_features SET {name} = ? WHERE chat_id = ?", (value, chat_id))
+
+    def record_news(self, chat_id: int, items: Iterable[NewsItem]) -> None:
+        """Conserva únicamente artículos que se hayan entregado correctamente al chat."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO news_history"
+                "(chat_id, fingerprint, topic, title, url, source, published_at, description, first_seen)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (chat_id, item.fingerprint, item.topic, item.title, item.url,
+                     item.source, item.published.astimezone(timezone.utc).isoformat(),
+                     item.description, now)
+                    for item in items if item.published is not None
+                ],
+            )
+
+    def weekly_news(self, chat_id: int, days: int = 7) -> list[dict]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT topic, title, url, source, published_at, description, fingerprint "
+                "FROM news_history WHERE chat_id = ? AND first_seen >= ? "
+                "ORDER BY published_at DESC LIMIT 150", (chat_id, cutoff)
+            )]
+
+    def news_count(self, chat_id: int, days: int = 7) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM news_history WHERE chat_id = ? AND first_seen >= ?",
+                (chat_id, cutoff),
+            ).fetchone()[0]
+
+    def claim_delivery(self, chat_id: int, kind: str, key: str) -> bool:
+        """Reserva una entrega, evitando duplicaciones por ejecución concurrente."""
+        if kind not in ("daily", "weekly", "alert"):
+            raise ValueError("Tipo de entrega desconocido")
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=2)).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM delivery_events WHERE chat_id = ? AND kind = ? "
+                "AND delivery_key = ? AND status = 'pending' AND created_at < ?",
+                (chat_id, kind, key, cutoff),
+            )
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO delivery_events"
+                "(chat_id, kind, delivery_key, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+                (chat_id, kind, key, now.isoformat()),
+            )
+            return cursor.rowcount == 1
+
+    def mark_delivery(self, chat_id: int, kind: str, key: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO delivery_events(chat_id, kind, delivery_key, status, created_at, sent_at) "
+                "VALUES (?, ?, ?, 'sent', ?, ?) "
+                "ON CONFLICT(chat_id, kind, delivery_key) DO UPDATE SET "
+                "status='sent', sent_at=excluded.sent_at",
+                (chat_id, kind, key, now, now),
+            )
+
+    def release_delivery(self, chat_id: int, kind: str, key: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM delivery_events WHERE chat_id = ? AND kind = ? "
+                "AND delivery_key = ? AND status = 'pending'",
+                (chat_id, kind, key),
+            )
+
+    def sent_count_since(self, chat_id: int, kind: str, utc_start: datetime) -> int:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE chat_id = ? AND kind = ? "
+                "AND status = 'sent' AND sent_at >= ?",
+                (chat_id, kind, utc_start.astimezone(timezone.utc).isoformat()),
+            ).fetchone()[0]
+
+    def latest_delivery(self, chat_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT kind, created_at, sent_at FROM delivery_events "
+                "WHERE chat_id = ? AND status = 'sent' ORDER BY sent_at DESC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def was_delivered(self, chat_id: int, fingerprint: str) -> bool:
         with self.connect() as conn:
             return conn.execute(
@@ -185,3 +335,5 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         with self.connect() as conn:
             conn.execute("DELETE FROM delivered WHERE sent_at < ?", (cutoff,))
+            conn.execute("DELETE FROM news_history WHERE first_seen < ?", (cutoff,))
+            conn.execute("DELETE FROM delivery_events WHERE created_at < ?", (cutoff,))
