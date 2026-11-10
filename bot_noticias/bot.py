@@ -588,6 +588,9 @@ async def category_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Usa /categoria seguido de: " + ", ".join(TOPICS) + "\nEjemplo: /categoria videojuegos"
         )
         return
+    if not get_db(context).get(update.effective_chat.id):
+        await update.message.reply_text("Primero envía /start para configurar el bot.")
+        return
     await update.message.reply_text("🔎 Consultando " + TOPICS[topic][1] + "...")
     await send_digest(context, update.effective_chat.id, [topic])
 
